@@ -5,11 +5,8 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer Weights {
     float w[];
 };
-layout(set = 1, binding = 0) buffer Input {
-    float x[];
-};
-layout(set = 1, binding = 1) buffer Output {
-    float output_vec[];
+layout(set = 1, binding = 0) buffer State { 
+    float s[]; 
 };
 
 layout(push_constant) uniform Constants {
@@ -18,17 +15,22 @@ layout(push_constant) uniform Constants {
     uint unused0;
     uint unused1;
     uint weight_offset;
+    uint src_offset;
+    uint dst_offset;
 } pc;
 
 void main() {
     float sum = 0.0;
+    
     for (uint i = 0; i < pc.dim; ++i) {
-        sum += x[i] * x[i];
+        float val = s[pc.src_offset + i];
+        sum += val * val;
     }
 
-    float rms = 1.0 / sqrt((sum / float(pc.dim)) + 1e-5);
+    float rms = sqrt(sum / float(pc.dim) + 1e-5f);
+    float scale = 1.0f / rms;
 
     for (uint i = 0; i < pc.dim; ++i) {
-        output_vec[i] = x[i] * rms * w[pc.weight_offset + i];
+        s[pc.dst_offset + i] = s[pc.src_offset + i] * scale * w[pc.weight_offset + i];
     }
 }

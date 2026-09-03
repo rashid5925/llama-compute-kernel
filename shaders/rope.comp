@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 1, binding = 0) buffer State { 
+    float s[]; 
+};
+
+layout(push_constant) uniform Constants {
+    uint layer; 
+    uint in_dim; 
+    uint out_dim; 
+    uint pos;
+    uint weight_offset; 
+    uint src_offset; 
+    uint dst_offset;
+    uint src2_offset; 
+    uint head_size;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x * 2;     // one thread per (i, i+1) pair
+    if (i >= pc.in_dim) return;
+
+    uint head_dim = i % pc.head_size;
+    float freq = 1.0 / pow(10000.0, float(head_dim) / float(pc.head_size));
+    float val  = float(pc.pos) * freq;
+    float fcr = cos(val), fci = sin(val);
+
+    float v0 = s[pc.src_offset + i];
+    float v1 = s[pc.src_offset + i + 1];
+    s[pc.src_offset + i]     = v0 * fcr - v1 * fci;
+    s[pc.src_offset + i + 1] = v0 * fci + v1 * fcr;
+}

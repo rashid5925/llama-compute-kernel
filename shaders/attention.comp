@@ -1,0 +1,68 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 1, binding = 0) buffer State { 
+    float s[]; 
+};
+
+layout(push_constant) uniform Constants {
+    uint layer; 
+    uint in_dim; 
+    uint out_dim; 
+    uint pos;
+    uint weight_offset; 
+    
+    uint src_offset; 
+    uint dst_offset;
+    uint src2_offset; 
+    uint head_size; 
+    uint n_heads;
+    uint kv_dim; 
+    uint seq_len; 
+    uint key_base; 
+    uint value_base;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) return;
+
+    uint n_kv_heads = pc.kv_dim / pc.head_size;
+    uint kv_mul     = pc.n_heads / n_kv_heads;   // 2 here
+    uint kv_head    = h / kv_mul;
+
+    uint q_off   = pc.src_offset  + h * pc.head_size;
+    uint att_off = pc.src2_offset + h * pc.seq_len;
+    uint xb_off  = pc.dst_offset  + h * pc.head_size;
+
+    // 1. scores against every cached key up to pos
+    float maxval = -1e30;
+    for (uint t = 0; t <= pc.pos; ++t) {
+        uint k_off = pc.key_base + t * pc.kv_dim + kv_head * pc.head_size;
+        float score = 0.0;
+        for (uint i = 0; i < pc.head_size; ++i)
+            score += s[q_off + i] * s[k_off + i];
+        score /= sqrt(float(pc.head_size));
+        s[att_off + t] = score;
+        maxval = max(maxval, score);
+    }
+
+    // 2. softmax (max-subtracted for stability)
+    float sum = 0.0;
+    for (uint t = 0; t <= pc.pos; ++t) {
+        float e = exp(s[att_off + t] - maxval);
+        s[att_off + t] = e;
+        sum += e;
+    }
+    for (uint t = 0; t <= pc.pos; ++t) s[att_off + t] /= sum;
+
+    // 3. weighted sum of values
+    for (uint i = 0; i < pc.head_size; ++i) s[xb_off + i] = 0.0;
+    for (uint t = 0; t <= pc.pos; ++t) {
+        uint v_off = pc.value_base + t * pc.kv_dim + kv_head * pc.head_size;
+        float a = s[att_off + t];
+        for (uint i = 0; i < pc.head_size; ++i)
+            s[xb_off + i] += a * s[v_off + i];
+    }
+}
