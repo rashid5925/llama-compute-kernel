@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <assert.h>
 #include <vulkan/vulkan.hpp>
+#include <chrono>
 
 struct TokenInfo {
     float score;
@@ -105,7 +106,7 @@ struct VulkanComputePipeline {
     VkPipeline ropePipeline;
 };
 
-std::vector<TokenInfo> read_vocab(std::ifstream& file) {
+std::vector<TokenInfo> read_vocab(std::ifstream& file, uint32_t vocab_size) {
     std::vector<TokenInfo> vocabulary;
     
     // 1. Read the max token length header (4 bytes)
@@ -115,8 +116,8 @@ std::vector<TokenInfo> read_vocab(std::ifstream& file) {
 
     int token_id = 0;
 
-    // 2. Loop to read up to 512 tokens
-    while (file.peek() != EOF && token_id < 512) {
+    // 2. Loop to read up to vocab_size tokens
+    while (file.peek() != EOF && token_id < vocab_size) {
         float score;
         int token_length;
 
@@ -140,14 +141,6 @@ std::vector<TokenInfo> read_vocab(std::ifstream& file) {
     std::cout << "------------------------------------\n";
 
     return vocabulary;
-}
-
-static bool starts_with(const std::string& str,
-                        size_t pos,
-                        const std::string& prefix)
-{
-    return pos + prefix.size() <= str.size() &&
-           str.compare(pos, prefix.size(), prefix) == 0;
 }
 
 std::vector<int> tokenize(const std::string& text, const std::vector<TokenInfo>& vocabulary) {
@@ -686,8 +679,8 @@ void forward_pass(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.matmulPipeline);
         vkCmdDispatch(cmd, (config.dim + 63) / 64, 1, 1);
 
-        // Memory Barrier between Operations
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        // Memory Barrier between Operations not needed as next shader do not read from prev
+        // vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
         // 3. Dispatch MatMul (Key Projection K)
         const uint32_t k_weight_offset = wk_base + (l * config.dim * kv_dim);
@@ -704,8 +697,8 @@ void forward_pass(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.matmulPipeline);
         vkCmdDispatch(cmd, (kv_dim + 63) / 64, 1, 1);
 
-        // Memory Barrier between Operations
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        // Memory Barrier between Operations not needed as next shader do not read from prev
+        // vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
         // 4. Dispatch MatMul (Value Projection V)
         const uint32_t v_weight_offset = wv_base + (l * config.dim * kv_dim);
@@ -955,7 +948,7 @@ void forward_pass(
         static_cast<uint32_t>(config.dim),
         static_cast<uint32_t>(config.vocab_size),
         current_pos,
-        0, // weight_offset not used for final projection
+        0, // weight_offset of embedding table is 0
         layout.xb,
         layout.logits
     };
@@ -997,13 +990,12 @@ int main() {
         std::cerr << "Failed to open weights/tok512.bin\n";
         return 1;
     }
-    std::vector<TokenInfo> vocabulary = read_vocab(file_tok);
-
     std::ifstream file_model("weights/stories260K.bin", std::ios::binary);
     if (!file_model) {
         std::cerr << "Failed to open weights/stories260K.bin\n";
         return 1;
     }
+
     Config config;
     TransformerWeights weights;
     std::vector<float> weight_buffer;
@@ -1012,6 +1004,8 @@ int main() {
         std::cerr << "Failed to load model weights\n";
         return 1;
     }
+
+    std::vector<TokenInfo> vocabulary = read_vocab(file_tok, config.vocab_size);
 
     std::string input_text = " Once upon a time";
     std::vector<int> token_ids = tokenize(input_text, vocabulary);
@@ -1095,19 +1089,20 @@ int main() {
     fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     res = vkCreateFence(device, &fenceCreateInfo, nullptr, &fence);
     assert(res == VK_SUCCESS);
-    
-    for (int i = 0; i < 32; ++i) {
-        vkResetCommandBuffer(cmd, 0);
-        vkResetFences(device, 1, &fence);
+
+    void* mapped_ptr = nullptr;
+    vkMapMemory(device, memory_activation, 0, activation_bytes, 0, &mapped_ptr);
+    float* host_activation_buf = static_cast<float*>(mapped_ptr);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 300 && i < config.seq_len; ++i) {
+        
 
         // Copy embedding vector 'x' into buffer_activation 
-        void* x;
-        vkMapMemory(device, memory_activation, 0, activation_bytes, 0, &x);
         int id = token_ids[i];
         size_t start_index = static_cast<size_t>(id) * config.dim;
         float* embedding_ptr = weights.token_embedding_table + start_index;
-        memcpy((char*)x, embedding_ptr, config.dim * sizeof(float));
-        vkUnmapMemory(device, memory_activation);
+        memcpy(host_activation_buf, embedding_ptr, config.dim * sizeof(float));
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1129,47 +1124,31 @@ int main() {
         assert(res == VK_SUCCESS);
         res = vkWaitForFences(device, 1, &fence, VK_TRUE, 100000000000);
         assert(res == VK_SUCCESS);
+        vkResetCommandBuffer(cmd, 0);
+        vkResetFences(device, 1, &fence);
 
         // Read back logits from buffer_activation
-        void* logits_ptr;
-        vkMapMemory(device, memory_activation, 0, activation_bytes, 0, &logits_ptr);
         std::vector<float> logits(config.vocab_size);
-        const float* s = static_cast<const float*>(logits_ptr);
-        memcpy(logits.data(), s + layout.logits, config.vocab_size * sizeof(float));
+        memcpy(logits.data(), host_activation_buf + layout.logits, config.vocab_size * sizeof(float));
 
         if (i >= static_cast<int>(prompt_length) - 1) {
             int next_token_id = sample_next_token(logits);
             token_ids.push_back(next_token_id);
-        } 
-        vkUnmapMemory(device, memory_activation);
-
-        void* p = nullptr;
-        vkMapMemory(device, memory_activation, 0, activation_bytes, 0, &p);
-        const float* s2 = static_cast<const float*>(p);
-
-        auto dump = [&](const char* name, uint32_t off, uint32_t n) {
-            std::cout << name << ": ";
-            for (uint32_t i = 0; i < n; ++i) std::cout << s2[off + i] << " ";
-            std::cout << "\n";
-        };
-
-        dump("xb (attn nrm)", layout.xb,  8);
-        dump("q (post-rope)", layout.q,   8);
-        dump("k (post-rope)", layout.key_cache + (0*config.seq_len + i)*kv_dim, 8);
-        dump("att h0",        layout.att, i + 1);
-        dump("hb (swiglu)",   layout.hb,  8);
-        dump("x (post-ffn)",  layout.x,   8);
-        dump("logits",        layout.logits, 8);
-        std::cout << "-----------------------------------------\n";
-        
-
-        vkUnmapMemory(device, memory_activation);
+        }
     }
-
+    
+    vkUnmapMemory(device, memory_activation);
     vkDestroyFence(device, fence, nullptr);
     vkDestroyCommandPool(device, commandPool, nullptr);
 
-    std::cout << "Original String Back from Token IDs: ";
+    auto end = std::chrono::high_resolution_clock::now();
+
+    // 3. Calculate duration
+    std::chrono::duration<double, std::milli> duration = end - start;
+
+    std::cout << "Loop execution time: " << duration.count() << " ms\n";
+
+    std::cout << "Generated Story: ";
     std::string output = get_string_from_token_ids(vocabulary, token_ids);
     std::cout << output << "\n";
 
