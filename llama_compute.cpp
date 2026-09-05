@@ -334,7 +334,12 @@ bool load_model_weights(std::ifstream& file, Config& config, TransformerWeights&
 std::string get_string_from_token_ids(const std::vector<TokenInfo>& vocabulary, std::vector<int> token_ids) {
     std::string output = "";
     for (int id : token_ids) {
-        output += vocabulary[id].text;
+        const std::string& token_text = vocabulary[id].text;
+        if (token_text[0] == '<' && token_text.back() == '>' && token_text[1] == '0') {
+            output += static_cast<char>(std::stoi(token_text.substr(3, 2), nullptr, 16)); 
+            continue;
+        }
+        output += token_text;
     }
     return output;
 }
@@ -1134,6 +1139,10 @@ int main() {
         if (i >= static_cast<int>(prompt_length) - 1) {
             int next_token_id = sample_next_token(logits);
             token_ids.push_back(next_token_id);
+
+            if (next_token_id == 1) { 
+                break;
+            }
         }
     }
     
@@ -1152,5 +1161,7 @@ int main() {
     std::string output = get_string_from_token_ids(vocabulary, token_ids);
     std::cout << output << "\n";
 
+    std::cout << "-------------------------" << "\n";
+    std::cout << "Total Tokens Generated: " << token_ids.size() << "\n";
     return 0;
 }
