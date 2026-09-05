@@ -1032,7 +1032,45 @@ int next_token_temp_topp(const std::vector<float>& logits, float temperature, fl
     return adjusted_logits[0].id;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    std::string filename = "weights/stories260K.bin";
+    std::string vocab_filename = "weights/tok512.bin";
+    std::string prompt = " Once upon a time";
+    float temp = 0.7f;
+    float top_p = 0.9f;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--model" && i + 1 < argc) {
+            filename = argv[++i];
+        } else if (arg == "--vocab" && i + 1 < argc) {
+            vocab_filename = argv[++i];
+        } else if (arg == "--prompt" && i + 1 < argc) {
+            prompt = argv[++i];
+            prompt = " " + prompt; 
+        } else if (arg == "--temp" && i + 1 < argc) {
+            temp = std::stof(argv[++i]);
+        } else if (arg == "--top_p" && i + 1 < argc) {
+            top_p = std::stof(argv[++i]);
+        } else if (arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [--model <model_file>] [--vocab <vocab_file>] [--prompt <prompt>] [--temp <temperature>] [--top_p <top_p>]\n";
+            return 0;
+        }
+    }
+
+    std::ifstream file_tok(vocab_filename, std::ios::binary);
+    if (!file_tok) {
+        std::cerr << "Failed to open " << vocab_filename << "\n";
+        return 1;
+    }
+    std::ifstream file_model(filename, std::ios::binary);
+    if (!file_model) {
+        std::cerr << "Failed to open " << filename << "\n";
+        return 1;
+    }
+
     VkResult res;
     VkInstance instance;
     VkApplicationInfo appInfo{};
@@ -1050,25 +1088,9 @@ int main() {
     create_device(queueCreateInfo, deviceCreateInfo, physicalDevice, queueFamilyIndex, deviceFeatures, device, res);
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
 
-    std::ifstream file_tok("weights/tokenizer.bin", std::ios::binary);
-    if (!file_tok) {
-        std::cerr << "Failed to open weights/tokenizer.bin\n";
-        return 1;
-    }
-    std::ifstream file_model("weights/stories110M.bin", std::ios::binary);
-    if (!file_model) {
-        std::cerr << "Failed to open weights/stories110M.bin\n";
-        return 1;
-    }
-
     Config config;
     TransformerWeights weights;
     std::vector<float> weight_buffer;
-
-    float temp = 0.7f;
-    float top_p = 0.9f;
-    std::random_device rd;
-    std::mt19937 rng(rd());
 
     if (!load_model_weights(file_model, config, weights, weight_buffer)) {
         std::cerr << "Failed to load model weights\n";
@@ -1077,8 +1099,7 @@ int main() {
 
     std::vector<TokenInfo> vocabulary = read_vocab(file_tok, config.vocab_size);
 
-    std::string input_text = " Once upon a time";
-    std::vector<int> token_ids = tokenize(input_text, vocabulary);
+    std::vector<int> token_ids = tokenize(prompt, vocabulary);
     token_ids.insert(token_ids.begin(), 1);
     const uint32_t prompt_length = static_cast<uint32_t>(token_ids.size());
 
@@ -1166,8 +1187,6 @@ int main() {
 
     auto start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 300 && i < config.seq_len; ++i) {
-        
-
         // Copy embedding vector 'x' into buffer_activation 
         int id = token_ids[i];
         size_t start_index = static_cast<size_t>(id) * config.dim;
