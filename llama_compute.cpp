@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <vulkan/vulkan.hpp>
 #include <chrono>
+#include <random>
 
 struct TokenInfo {
     float score;
@@ -67,6 +68,11 @@ struct PushConstants {
 struct StateLayout {
     uint32_t x, xb, xb2, q, k, v, att, hb, hb2, logits, key_cache, value_cache;
     uint32_t total_floats;
+};
+
+struct TokenProb {
+    int id;
+    float prob;
 };
 
 StateLayout make_layout(const Config& c) {
@@ -972,6 +978,60 @@ int sample_next_token(const std::vector<float>& logits) {
     return max_index;
 }
 
+int next_token_temp_topp(const std::vector<float>& logits, float temperature, float top_p, std::mt19937& rng) {
+    if (temperature <= 0.0f) {
+        return sample_next_token(logits);
+    }
+    
+    // P(i) = exp(z_i / temperature) / sum_j exp(z_j / temperature)
+    std::vector<TokenProb> adjusted_logits(logits.size());
+    float max_logit = *std::max_element(logits.begin(), logits.end());
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        float scaled_logit = (logits[i] - max_logit) / temperature;
+        float exp_val = std::exp(scaled_logit);
+        adjusted_logits[i] = { static_cast<int>(i), exp_val };
+        sum_exp += exp_val;
+    }
+
+    for (size_t i = 0; i < adjusted_logits.size(); ++i) {
+        adjusted_logits[i].prob /= sum_exp;
+    }
+
+
+    // sort, cut off at sum_probability >= top_p
+    std::sort(adjusted_logits.begin(), adjusted_logits.end(), [](const TokenProb& a, const TokenProb& b) {
+        return a.prob > b.prob;
+    });
+    float cumulative_prob = 0.0f;
+    size_t cutoff_index = adjusted_logits.size();
+    for (size_t i = 0; i < adjusted_logits.size(); ++i) {
+        cumulative_prob += adjusted_logits[i].prob;
+        if (cumulative_prob >= top_p) {
+            cutoff_index = i;
+            break;
+        }
+    }
+
+    /*
+    0.0                      0.60             0.90        1.0
+    [======== apple ========][=== banana ===][= cherry =]
+                      |
+               random_cutoff = 0.50  ---> Pick "apple"
+    */
+    std::uniform_real_distribution<float> dist(0.0f, cumulative_prob); // define the range for the random number
+    float random_cutoff = dist(rng); // Generate a random cutoff value between 0 and cumulative_prob
+    float current_sum = 0.0f;
+    for (size_t i = 0; i < cutoff_index; ++i) {
+        current_sum += adjusted_logits[i].prob;
+        if (current_sum >= random_cutoff) {
+            return adjusted_logits[i].id;
+        }
+    }
+
+    return adjusted_logits[0].id;
+}
+
 int main() {
     VkResult res;
     VkInstance instance;
@@ -990,20 +1050,25 @@ int main() {
     create_device(queueCreateInfo, deviceCreateInfo, physicalDevice, queueFamilyIndex, deviceFeatures, device, res);
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &queue);
 
-    std::ifstream file_tok("weights/tok512.bin", std::ios::binary);
+    std::ifstream file_tok("weights/tokenizer.bin", std::ios::binary);
     if (!file_tok) {
-        std::cerr << "Failed to open weights/tok512.bin\n";
+        std::cerr << "Failed to open weights/tokenizer.bin\n";
         return 1;
     }
-    std::ifstream file_model("weights/stories260K.bin", std::ios::binary);
+    std::ifstream file_model("weights/stories110M.bin", std::ios::binary);
     if (!file_model) {
-        std::cerr << "Failed to open weights/stories260K.bin\n";
+        std::cerr << "Failed to open weights/stories110M.bin\n";
         return 1;
     }
 
     Config config;
     TransformerWeights weights;
     std::vector<float> weight_buffer;
+
+    float temp = 0.7f;
+    float top_p = 0.9f;
+    std::random_device rd;
+    std::mt19937 rng(rd());
 
     if (!load_model_weights(file_model, config, weights, weight_buffer)) {
         std::cerr << "Failed to load model weights\n";
@@ -1137,7 +1202,7 @@ int main() {
         memcpy(logits.data(), host_activation_buf + layout.logits, config.vocab_size * sizeof(float));
 
         if (i >= static_cast<int>(prompt_length) - 1) {
-            int next_token_id = sample_next_token(logits);
+            int next_token_id = next_token_temp_topp(logits, temp, top_p, rng);
             token_ids.push_back(next_token_id);
 
             if (next_token_id == 1) { 
@@ -1145,12 +1210,11 @@ int main() {
             }
         }
     }
+    auto end = std::chrono::high_resolution_clock::now();
     
     vkUnmapMemory(device, memory_activation);
     vkDestroyFence(device, fence, nullptr);
     vkDestroyCommandPool(device, commandPool, nullptr);
-
-    auto end = std::chrono::high_resolution_clock::now();
 
     // 3. Calculate duration
     std::chrono::duration<double, std::milli> duration = end - start;
