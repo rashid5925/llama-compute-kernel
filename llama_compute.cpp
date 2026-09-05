@@ -1033,8 +1033,8 @@ int next_token_temp_topp(const std::vector<float>& logits, float temperature, fl
 }
 
 int main(int argc, char** argv) {
-    std::string filename = "weights/stories260K.bin";
-    std::string vocab_filename = "weights/tok512.bin";
+    std::string filename = "../weights/stories260K.bin";
+    std::string vocab_filename = "../weights/tok512.bin";
     std::string prompt = " Once upon a time";
     float temp = 0.7f;
     float top_p = 0.9f;
